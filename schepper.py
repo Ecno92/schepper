@@ -11,7 +11,7 @@ from typing import Union
 
 import click
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
 
 CONFIG_FILE = "schepper.yaml"
 
@@ -23,6 +23,9 @@ cpus: 0
 storage: 10g
 ports: []
 ssh: false
+network:
+  allow: []
+  deny: []
 """
 
 _SIZE_RE = re.compile(r"^\d+[mg]$", re.IGNORECASE)
@@ -31,6 +34,36 @@ _SIZE_RE = re.compile(r"^\d+[mg]$", re.IGNORECASE)
 # ---------------------------------------------------------------------------
 # Config model
 # ---------------------------------------------------------------------------
+
+class NetworkConfig(BaseModel):
+    """Sandbox-scoped network policy rules (``sbx policy allow|deny network --sandbox``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    allow: list[str] = []
+    deny: list[str] = []
+
+    @field_validator("allow", "deny")
+    @classmethod
+    def validate_resources(cls, v: list[str]) -> list[str]:
+        result = []
+        for raw in v:
+            r = str(raw).strip()
+            if not r:
+                raise ValueError("empty network resource")
+            if "," in r or any(c.isspace() for c in r):
+                raise ValueError(f"'{raw}': list one resource per entry (no commas or spaces)")
+            if r not in result:
+                result.append(r)
+        return result
+
+    @model_validator(mode="after")
+    def check_overlap(self) -> "NetworkConfig":
+        both = sorted(set(self.allow) & set(self.deny))
+        if both:
+            raise ValueError(f"resources in both allow and deny: {', '.join(both)}")
+        return self
+
 
 class SandboxConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -42,6 +75,7 @@ class SandboxConfig(BaseModel):
     storage: str = "10g"
     ports: list[Union[str, int]] = []
     ssh: bool = False
+    network: NetworkConfig = NetworkConfig()
 
     @field_validator("memory", "storage")
     @classmethod
@@ -154,6 +188,60 @@ def get_published_ports(name: str) -> set[int]:
         return set()
 
 
+# Rules created by other means (e.g. "provisioned" by the kit, "default") are
+# left alone; only rules a user added by hand are owned by schepper.yaml.
+_MANAGED_RULE_ORIGINS = {"added"}
+
+
+def get_network_rules(name: str) -> dict[str, set[str]]:
+    """Return the sandbox-scoped, user-added network rules as {"allow": {...}, "deny": {...}}."""
+    rules: dict[str, set[str]] = {"allow": set(), "deny": set()}
+    result = sh(["sbx", "policy", "ls", name, "--json"], check=False, capture=True)
+    if result.returncode != 0 or not result.stdout.strip():
+        return rules
+    try:
+        data = json.loads(result.stdout) or {}
+        for rule in data.get("rules") or []:
+            if rule.get("scope") != f"sandbox:{name}":
+                continue
+            if rule.get("resource_type") != "network":
+                continue
+            if (rule.get("provenance") or {}).get("created_via") not in _MANAGED_RULE_ORIGINS:
+                continue
+            decision = rule.get("decision")
+            if decision in rules:
+                rules[decision].update(rule.get("resources") or [])
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        pass
+    return rules
+
+
+def network_diff(desired: NetworkConfig, current: dict[str, set[str]]) -> list[tuple[str, str, str]]:
+    """Return (op, decision, resource) tuples; removals first so a resource can switch sides."""
+    changes = []
+    for decision in ("allow", "deny"):
+        want = set(getattr(desired, decision))
+        for r in sorted(current[decision] - want):
+            changes.append(("-", decision, r))
+    for decision in ("allow", "deny"):
+        want = set(getattr(desired, decision))
+        for r in sorted(want - current[decision]):
+            changes.append(("+", decision, r))
+    return changes
+
+
+def apply_network_changes(name: str, changes: list[tuple[str, str, str]]) -> None:
+    for op, decision, resource in changes:
+        if op == "-":
+            cmd = ["sbx", "policy", "rm", "network", "--sandbox", name, "--resource", resource, "--force"]
+        else:
+            cmd = ["sbx", "policy", decision, "network", "--sandbox", name, resource]
+        r = sh(cmd, check=False)
+        if r.returncode != 0:
+            verb = "remove" if op == "-" else "add"
+            click.echo(f"  Warning: failed to {verb} {decision} rule for {resource}", err=True)
+
+
 def memory_to_mib(s: str) -> int:
     s = s.lower().removesuffix("b")
     if s.endswith("g"):
@@ -215,6 +303,8 @@ def up():
             cmd += ["--cpus", str(config.cpus)]
         for port in sorted(desired_ports):
             cmd += ["-p", f"{port}:{port}"]
+        for resource in config.network.deny:
+            cmd += ["--deny-network", resource]
         cmd += [config.kit, str(Path.cwd())]
 
         click.echo(f"Will create sandbox '{name}' with:")
@@ -222,16 +312,21 @@ def up():
         click.echo(f"  memory:  {config.memory}")
         click.echo(f"  storage: {config.storage}")
         click.echo(f"  ports:   {', '.join(str(p) for p in sorted(desired_ports)) or 'none'}")
+        click.echo(f"  allow:   {', '.join(config.network.allow) or 'none'}")
+        click.echo(f"  deny:    {', '.join(config.network.deny) or 'none'}")
         click.confirm("Create?", abort=True)
         sh(cmd, extra_env={"DOCKER_SANDBOXES_ROOT_SIZE": config.storage})
         click.echo(f"Sandbox '{name}' created.")
+        apply_network_changes(name, [("+", "allow", r) for r in config.network.allow])
     else:
         # Reconcile ports
         current_ports = get_published_ports(name)
         to_add = desired_ports - current_ports
         to_remove = current_ports - desired_ports
+        changed = False
 
         if to_add or to_remove:
+            changed = True
             click.echo(f"Port changes for '{name}':")
             for port in sorted(to_add):
                 click.echo(f"  + {port}:{port}")
@@ -246,7 +341,18 @@ def up():
                 r = sh(["sbx", "ports", name, "--unpublish", f"{port}:{port}"], check=False)
                 if r.returncode != 0:
                     click.echo(f"  Warning: failed to unpublish {port}", err=True)
-        else:
+
+        # Reconcile network policy rules
+        net_changes = network_diff(config.network, get_network_rules(name))
+        if net_changes:
+            changed = True
+            click.echo(f"Network policy changes for '{name}':")
+            for op, decision, resource in net_changes:
+                click.echo(f"  {op} {decision} {resource}")
+            click.confirm("Apply?", abort=True)
+            apply_network_changes(name, net_changes)
+
+        if not changed:
             click.echo(f"Sandbox '{name}' is up to date.")
 
     if config.ssh:
@@ -291,6 +397,9 @@ def status():
     click.echo(f"memory:    {info.get('memory', '?')}")
     click.echo(f"workspace: {workspace}")
     click.echo(f"ports:     {', '.join(str(p) for p in ports) or 'none'}")
+    rules = get_network_rules(name)
+    click.echo(f"allow:     {', '.join(sorted(rules['allow'])) or 'none'}")
+    click.echo(f"deny:      {', '.join(sorted(rules['deny'])) or 'none'}")
 
 
 @cli.command()
@@ -358,6 +467,7 @@ def inspect(name):
         "storage": "10g",  # not exposed by sbx; adjust to match the value used at creation
         "ports": ports,
         "ssh": False,
+        "network": {k: sorted(v) for k, v in get_network_rules(name).items()},
     }
 
     click.echo(f"# schepper.yaml — inspected from sandbox '{name}'")

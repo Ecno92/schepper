@@ -13,7 +13,7 @@ import pytest
 from click.testing import CliRunner
 from pydantic import ValidationError
 
-from schepper import SandboxConfig, cli, expand_ports, memory_to_mib
+from schepper import NetworkConfig, SandboxConfig, cli, expand_ports, memory_to_mib, network_diff
 
 # ---------------------------------------------------------------------------
 # Shared test data  — realistic sbx --json payloads
@@ -75,12 +75,34 @@ def make_sh(responses: dict):
     return mock_sh
 
 
-def default_sh(sandboxes=None, ports=None):
+def policy_rule(decision, resources, created_via="added", scope="sandbox:myproject"):
+    return {
+        "id": f"{decision}-{resources[0]}",
+        "scope": scope,
+        "applies_to": scope,
+        "resource_type": "network",
+        "decision": decision,
+        "resources": resources,
+        "provenance": {"created_via": created_via},
+    }
+
+
+def default_sh(sandboxes=None, ports=None, rules=None):
     """Standard sbx mock used by most up/status/run tests."""
     return make_sh({
         "sbx ls --json":              {"stdout": json.dumps(sandboxes or [])},
         "sbx ports myproject --json": {"stdout": json.dumps(ports or [])},
+        "sbx policy ls myproject --json": {"stdout": json.dumps({"rules": rules or []})},
     })
+
+
+def tracking(base):
+    calls = []
+
+    def tracking_sh(cmd, **kwargs):
+        calls.append(list(cmd))
+        return base(cmd, **kwargs)
+    return calls, tracking_sh
 
 
 @pytest.fixture
@@ -525,3 +547,115 @@ class TestRm:
 
         assert result.exit_code != 0
         assert "Could not remove" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Network allow / deny lists
+# ---------------------------------------------------------------------------
+
+NET_CONFIG = CONFIG + """\
+network:
+  allow:
+    - api.example.com
+    - "*.pypi.org:443"
+  deny:
+    - evil.example.com
+"""
+
+
+class TestNetworkConfig:
+    def test_defaults_empty(self):
+        c = SandboxConfig(name="x")
+        assert c.network.allow == [] and c.network.deny == []
+
+    def test_dedupes_and_strips(self):
+        assert NetworkConfig(allow=[" a.com ", "a.com"]).allow == ["a.com"]
+
+    def test_overlap_rejected(self):
+        with pytest.raises(ValidationError):
+            NetworkConfig(allow=["a.com"], deny=["a.com"])
+
+    def test_comma_rejected(self):
+        with pytest.raises(ValidationError):
+            NetworkConfig(allow=["a.com,b.com"])
+
+    def test_unknown_key_rejected(self):
+        with pytest.raises(ValidationError):
+            SandboxConfig(name="x", network={"permit": ["a.com"]})
+
+    def test_diff_removes_before_adding(self):
+        desired = NetworkConfig(deny=["a.com"])
+        current = {"allow": {"a.com"}, "deny": set()}
+        assert network_diff(desired, current) == [("-", "allow", "a.com"), ("+", "deny", "a.com")]
+
+
+class TestNetworkUp:
+    def test_create_passes_deny_and_adds_allow(self, runner):
+        calls, sh = tracking(default_sh())
+        with runner.isolated_filesystem():
+            Path("schepper.yaml").write_text(NET_CONFIG)
+            with patch("schepper.sh", sh):
+                result = runner.invoke(cli, ["up"], input="y\n")
+        assert result.exit_code == 0, result.output
+        create = next(c for c in calls if "create" in c)
+        assert create[create.index("--deny-network") + 1] == "evil.example.com"
+        assert ["sbx", "policy", "allow", "network", "--sandbox", "myproject", "api.example.com"] in calls
+        assert ["sbx", "policy", "allow", "network", "--sandbox", "myproject", "*.pypi.org:443"] in calls
+
+    def test_existing_in_sync_is_up_to_date(self, runner):
+        rules = [
+            policy_rule("allow", ["api.example.com", "*.pypi.org:443"]),
+            policy_rule("deny", ["evil.example.com"]),
+        ]
+        with runner.isolated_filesystem():
+            Path("schepper.yaml").write_text(NET_CONFIG)
+            with patch("schepper.sh", default_sh(sandboxes=[SANDBOX_RUNNING], rules=rules)):
+                result = runner.invoke(cli, ["up"])
+        assert result.exit_code == 0, result.output
+        assert "up to date" in result.output
+
+    def test_reconciles_added_and_removed(self, runner):
+        rules = [policy_rule("allow", ["api.example.com", "stale.example.com"])]
+        calls, sh = tracking(default_sh(sandboxes=[SANDBOX_RUNNING], rules=rules))
+        with runner.isolated_filesystem():
+            Path("schepper.yaml").write_text(NET_CONFIG)
+            with patch("schepper.sh", sh):
+                result = runner.invoke(cli, ["up"], input="y\n")
+        assert result.exit_code == 0, result.output
+        assert "- allow stale.example.com" in result.output
+        assert "+ allow *.pypi.org:443" in result.output
+        assert "+ deny evil.example.com" in result.output
+        assert ["sbx", "policy", "rm", "network", "--sandbox", "myproject",
+                "--resource", "stale.example.com", "--force"] in calls
+        assert ["sbx", "policy", "deny", "network", "--sandbox", "myproject", "evil.example.com"] in calls
+
+    def test_ignores_provisioned_and_global_rules(self, runner):
+        rules = [
+            policy_rule("allow", ["api.anthropic.com:443"], created_via="provisioned"),
+            policy_rule("allow", ["github.com:443"], created_via="default", scope="global"),
+        ]
+        with runner.isolated_filesystem():
+            Path("schepper.yaml").write_text(CONFIG)
+            with patch("schepper.sh", default_sh(sandboxes=[SANDBOX_RUNNING], rules=rules)):
+                result = runner.invoke(cli, ["up"])
+        assert result.exit_code == 0, result.output
+        assert "up to date" in result.output
+
+    def test_network_reconcile_abort(self, runner):
+        with runner.isolated_filesystem():
+            Path("schepper.yaml").write_text(NET_CONFIG)
+            with patch("schepper.sh", default_sh(sandboxes=[SANDBOX_RUNNING])):
+                result = runner.invoke(cli, ["up"], input="n\n")
+        assert result.exit_code != 0
+
+    def test_status_and_inspect_show_rules(self, runner):
+        rules = [policy_rule("allow", ["api.example.com"]), policy_rule("deny", ["evil.example.com"])]
+        with runner.isolated_filesystem():
+            Path("schepper.yaml").write_text(CONFIG)
+            with patch("schepper.sh", default_sh(sandboxes=[SANDBOX_RUNNING], rules=rules)):
+                status = runner.invoke(cli, ["status"])
+                inspect = runner.invoke(cli, ["inspect"])
+        assert "allow:     api.example.com" in status.output
+        assert "deny:      evil.example.com" in status.output
+        assert "- api.example.com" in inspect.output
+        assert "- evil.example.com" in inspect.output

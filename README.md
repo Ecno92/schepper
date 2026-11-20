@@ -48,6 +48,12 @@ ports:
   - 3000
   - 8000-8010
 ssh: false
+network:
+  allow:
+    - api.example.com
+    - "*.pypi.org:443"
+  deny:
+    - tracker.example.com
 ```
 
 | Field | Default | Description |
@@ -59,8 +65,12 @@ ssh: false
 | `storage` | `10g` | VM root disk size. Cannot be changed on an existing sandbox — requires `schepper rm && schepper up`. |
 | `ports` | `[]` | Ports to publish. Ranges like `8000-8010` are expanded. |
 | `ssh` | `false` | When `true`, runs `sbx setup ssh` on every `schepper up` |
+| `network.allow` | `[]` | Hosts this sandbox may reach, on top of the global `sbx` policy. One pattern per entry (`example.com`, `*.example.com`, `example.com:443`, CIDRs). |
+| `network.deny` | `[]` | Hosts this sandbox may never reach; deny wins over any allow, including global ones. |
 
 Ports are always mapped symmetrically (`3000:3000`), so `localhost:3000` works identically inside and outside the sandbox — Claude can suggest a preview URL and it just works.
+
+Network rules are applied as sandbox-scoped `sbx policy` rules (`sbx policy allow|deny network --sandbox <name>`). `schepper up` adds missing rules and removes rules that are no longer listed, after confirmation. Only rules added by hand are managed — the global defaults and the rules a kit provisions are left alone. Use `sbx policy log <name>` to see which hosts were blocked.
 
 ## Notes
 
