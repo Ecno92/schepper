@@ -86,6 +86,14 @@ uv sync --extra dev
 uv run pytest tests/ -v
 ```
 
+Switch the installed `schepper` command between versions with [just](https://github.com/casey/just):
+
+```sh
+just install-dev   # editable install from this checkout
+just install       # latest release from PyPI
+just uninstall     # remove it completely
+```
+
 To publish a new release:
 
 ```sh
