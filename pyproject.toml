@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "schepper"
-version = "0.1.0"
+version = "0.1.1"
 description = "Declarative manager for Docker Sandboxes (sbx)"
 readme = "README.md"
 license = { text = "MPL-2.0" }
